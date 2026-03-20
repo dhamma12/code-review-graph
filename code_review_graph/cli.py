@@ -111,8 +111,10 @@ def _handle_init(args: argparse.Namespace) -> None:
                 return
             existing.setdefault("mcpServers", {}).update(mcp_config["mcpServers"])
             mcp_config = existing
-        except (json.JSONDecodeError, KeyError):
-            print(f"Warning: existing {mcp_path} is malformed, overwriting.")
+        except json.JSONDecodeError:
+            print(f"Warning: existing {mcp_path} has invalid JSON, overwriting.")
+        except (KeyError, TypeError):
+            print(f"Warning: existing {mcp_path} has unexpected structure, overwriting.")
 
     if dry_run:
         print(f"[dry-run] Would write to {mcp_path}:")
@@ -181,7 +183,8 @@ def main() -> None:
     vis_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
     # serve
-    sub.add_parser("serve", help="Start MCP server (stdio transport)")
+    serve_cmd = sub.add_parser("serve", help="Start MCP server (stdio transport)")
+    serve_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
     args = ap.parse_args()
 
@@ -195,7 +198,7 @@ def main() -> None:
 
     if args.command == "serve":
         from .main import main as serve_main
-        serve_main()
+        serve_main(repo_root=args.repo)
         return
 
     if args.command in ("init", "install"):

@@ -1,6 +1,6 @@
 """MCP tool definitions for the Code Review Graph server.
 
-Exposes 8 tools:
+Exposes 9 tools:
 1. build_or_update_graph  - full or incremental build
 2. get_impact_radius      - blast radius from changed files
 3. query_graph            - predefined graph queries
@@ -9,6 +9,7 @@ Exposes 8 tools:
 6. list_graph_stats       - aggregate statistics
 7. embed_graph            - compute vector embeddings for semantic search
 8. get_docs_section       - token-optimized documentation retrieval
+9. find_large_functions   - find oversized functions/classes by line count
 """
 
 from __future__ import annotations
@@ -26,6 +27,48 @@ from .incremental import (
     get_staged_and_unstaged,
     incremental_update,
 )
+
+# Common JS/TS builtin method names filtered from callers_of results.
+# "Who calls .map()?" returns hundreds of hits and is never useful.
+# These are kept in the graph (callees_of still shows them) but excluded
+# when doing reverse call tracing to reduce noise.
+_BUILTIN_CALL_NAMES: set[str] = {
+    "map", "filter", "reduce", "reduceRight", "forEach", "find", "findIndex",
+    "some", "every", "includes", "indexOf", "lastIndexOf",
+    "push", "pop", "shift", "unshift", "splice", "slice",
+    "concat", "join", "flat", "flatMap", "sort", "reverse", "fill",
+    "keys", "values", "entries", "from", "isArray", "of", "at",
+    "trim", "trimStart", "trimEnd", "split", "replace", "replaceAll",
+    "match", "matchAll", "search", "substring", "substr",
+    "toLowerCase", "toUpperCase", "startsWith", "endsWith",
+    "padStart", "padEnd", "repeat", "charAt", "charCodeAt",
+    "assign", "freeze", "defineProperty", "getOwnPropertyNames",
+    "hasOwnProperty", "create", "is", "fromEntries",
+    "log", "warn", "error", "info", "debug", "trace", "dir", "table",
+    "time", "timeEnd", "assert", "clear", "count",
+    "then", "catch", "finally", "resolve", "reject", "all", "allSettled", "race", "any",
+    "parse", "stringify",
+    "floor", "ceil", "round", "random", "max", "min", "abs", "pow", "sqrt",
+    "addEventListener", "removeEventListener", "querySelector", "querySelectorAll",
+    "getElementById", "createElement", "appendChild", "removeChild",
+    "setAttribute", "getAttribute", "preventDefault", "stopPropagation",
+    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "toString", "valueOf", "toJSON", "toISOString",
+    "getTime", "getFullYear", "now",
+    "isNaN", "parseInt", "parseFloat", "toFixed",
+    "encodeURIComponent", "decodeURIComponent",
+    "call", "apply", "bind", "next",
+    "emit", "on", "off", "once",
+    "pipe", "write", "read", "end", "close", "destroy",
+    "send", "status", "json", "redirect",
+    "set", "get", "delete", "has",
+    "findUnique", "findFirst", "findMany", "createMany",
+    "update", "updateMany", "deleteMany", "upsert",
+    "aggregate", "groupBy", "transaction",
+    "describe", "it", "test", "expect", "beforeEach", "afterEach",
+    "beforeAll", "afterAll", "mock", "spyOn",
+    "require", "fetch",
+}
 
 
 def _validate_repo_root(path: Path) -> Path:
@@ -223,6 +266,17 @@ def query_graph(
         results: list[dict] = []
         edges_out: list[dict] = []
 
+        # For callers_of, skip common builtins early (bare names only)
+        # "Who calls .map()?" returns hundreds of useless hits.
+        # Qualified names (e.g. "utils.py::map") bypass this filter.
+        if pattern == "callers_of" and target in _BUILTIN_CALL_NAMES and "::" not in target:
+            return {
+                "status": "ok", "pattern": pattern, "target": target,
+                "description": _QUERY_PATTERNS[pattern],
+                "summary": f"'{target}' is a common builtin — callers_of skipped to avoid noise.",
+                "results": [], "edges": [],
+            }
+
         # Resolve target - try as-is, then as absolute path, then search
         node = store.get_node(target)
         if not node:
@@ -252,6 +306,15 @@ def query_graph(
         if pattern == "callers_of":
             for e in store.get_edges_by_target(qn):
                 if e.kind == "CALLS":
+                    caller = store.get_node(e.source_qualified)
+                    if caller:
+                        results.append(node_to_dict(caller))
+                    edges_out.append(edge_to_dict(e))
+            # Fallback: CALLS edges store unqualified target names
+            # (e.g. "generateTestCode") while qn is fully qualified
+            # (e.g. "file.ts::generateTestCode"). Search by plain name too.
+            if not results and node:
+                for e in store.search_edges_by_target_name(node.name):
                     caller = store.get_node(e.source_qualified)
                     if caller:
                         results.append(node_to_dict(caller))
@@ -712,13 +775,7 @@ def embed_graph(repo_root: str | None = None) -> dict[str, Any]:
 # Tool 8: get_docs_section
 # ---------------------------------------------------------------------------
 
-# Search paths for the LLM-optimized reference file
-_REFERENCE_PATHS = [
-    "docs/LLM-OPTIMIZED-REFERENCE.md",
-]
-
-
-def get_docs_section(section_name: str) -> dict[str, Any]:
+def get_docs_section(section_name: str, repo_root: str | None = None) -> dict[str, Any]:
     """Return a specific section from the LLM-optimized reference.
 
     Used by skills and Claude Code to load only the exact documentation
@@ -728,41 +785,41 @@ def get_docs_section(section_name: str) -> dict[str, Any]:
         section_name: Exact section name. One of: usage, review-delta,
                       review-pr, commands, legal, watch, embeddings,
                       languages, troubleshooting.
+        repo_root: Repository root path. Auto-detected from current directory if omitted.
 
     Returns:
         The section content, or an error if not found.
     """
     import re as _re
 
-    # Try package-relative path first (works even outside a git repo)
-    pkg_dir = Path(__file__).resolve().parent.parent
-    search_roots = [pkg_dir]
+    search_roots: list[Path] = []
 
-    # Also try repo root if inside a git repo
+    if repo_root:
+        search_roots.append(Path(repo_root))
+
     try:
-        _, root = _get_store()
+        _, root = _get_store(repo_root)
         if root not in search_roots:
             search_roots.append(root)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         pass
 
     for search_root in search_roots:
-        for rel_path in _REFERENCE_PATHS:
-            full_path = search_root / rel_path
-            if full_path.exists():
-                content = full_path.read_text()
-                match = _re.search(
-                    rf'<section name="{_re.escape(section_name)}">'
-                    r"(.*?)</section>",
-                    content,
-                    _re.DOTALL | _re.IGNORECASE,
-                )
-                if match:
-                    return {
-                        "status": "ok",
-                        "section": section_name,
-                        "content": match.group(1).strip(),
-                    }
+        candidate = search_root / "docs" / "LLM-OPTIMIZED-REFERENCE.md"
+        if candidate.exists():
+            content = candidate.read_text(encoding="utf-8")
+            match = _re.search(
+                rf'<section name="{_re.escape(section_name)}">'
+                r"(.*?)</section>",
+                content,
+                _re.DOTALL | _re.IGNORECASE,
+            )
+            if match:
+                return {
+                    "status": "ok",
+                    "section": section_name,
+                    "content": match.group(1).strip(),
+                }
 
     available = [
         "usage", "review-delta", "review-pr", "commands",
@@ -775,3 +832,75 @@ def get_docs_section(section_name: str) -> dict[str, Any]:
             f"Available: {', '.join(available)}"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool 9: find_large_functions
+# ---------------------------------------------------------------------------
+
+
+def find_large_functions(
+    min_lines: int = 50,
+    kind: str | None = None,
+    file_path_pattern: str | None = None,
+    limit: int = 50,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Find functions, classes, or files exceeding a line-count threshold.
+
+    Useful for identifying decomposition targets, code-quality audits,
+    and enforcing size limits during code review.
+
+    Args:
+        min_lines: Minimum line count to flag (default: 50).
+        kind: Filter by node kind: Function, Class, File, or Test.
+        file_path_pattern: Filter by file path substring (e.g. "components/").
+        limit: Maximum results (default: 50).
+        repo_root: Repository root path. Auto-detected if omitted.
+
+    Returns:
+        Oversized nodes with line counts, ordered largest first.
+    """
+    store, root = _get_store(repo_root)
+    try:
+        nodes = store.get_nodes_by_size(
+            min_lines=min_lines,
+            kind=kind,
+            file_path_pattern=file_path_pattern,
+            limit=limit,
+        )
+
+        results = []
+        for n in nodes:
+            d = node_to_dict(n)
+            d["line_count"] = (n.line_end - n.line_start + 1) if n.line_start and n.line_end else 0
+            # Make file_path relative for readability
+            try:
+                d["relative_path"] = str(Path(n.file_path).relative_to(root))
+            except ValueError:
+                d["relative_path"] = n.file_path
+            results.append(d)
+
+        summary_parts = [
+            f"Found {len(results)} node(s) with >= {min_lines} lines"
+            + (f" (kind={kind})" if kind else "")
+            + (f" matching '{file_path_pattern}'" if file_path_pattern else "")
+            + ":",
+        ]
+        for r in results[:10]:
+            summary_parts.append(
+                f"  {r['line_count']:>4} lines | {r['kind']:>8} | "
+                f"{r['name']} ({r['relative_path']}:{r['line_start']})"
+            )
+        if len(results) > 10:
+            summary_parts.append(f"  ... and {len(results) - 10} more")
+
+        return {
+            "status": "ok",
+            "summary": "\n".join(summary_parts),
+            "total_found": len(results),
+            "min_lines": min_lines,
+            "results": results,
+        }
+    finally:
+        store.close()

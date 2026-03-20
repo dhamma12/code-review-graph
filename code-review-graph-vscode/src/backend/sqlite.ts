@@ -160,6 +160,44 @@ export class SqliteReader {
     throw lastError;
   }
 
+  /**
+   * Check if the database schema is compatible with this extension version.
+   * Returns a warning message if incompatible, or undefined if OK.
+   */
+  checkSchemaCompatibility(): string | undefined {
+    if (!this.db) { return 'Database is not open'; }
+    try {
+      // Check that required tables exist
+      const tables = this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .all() as Array<{ name: string }>;
+      const tableNames = new Set(tables.map((t) => t.name));
+
+      if (!tableNames.has('nodes') || !tableNames.has('edges')) {
+        return 'Database is missing required tables (nodes/edges). Rebuild required.';
+      }
+
+      // Check for schema_version in metadata if it exists
+      if (tableNames.has('metadata')) {
+        const row = this.db
+          .prepare("SELECT value FROM metadata WHERE key = 'schema_version'")
+          .get() as { value: string } | undefined;
+        if (row) {
+          const version = parseInt(row.value, 10);
+          // Current supported schema version
+          const SUPPORTED_SCHEMA_VERSION = 1;
+          if (!isNaN(version) && version > SUPPORTED_SCHEMA_VERSION) {
+            return `Database was created with a newer version (schema v${version}). Update the extension.`;
+          }
+        }
+      }
+
+      return undefined;
+    } catch {
+      return 'Could not verify database schema.';
+    }
+  }
+
   /** Close the database connection. Safe to call multiple times. */
   close(): void {
     if (this.db) {
@@ -437,6 +475,51 @@ export class SqliteReader {
     const edges = allQns.size > 0 ? this.getEdgesAmong(allQns) : [];
 
     return { changedNodes, impactedNodes, impactedFiles, edges };
+  }
+
+  // -----------------------------------------------------------------------
+  // Size-based queries
+  // -----------------------------------------------------------------------
+
+  /**
+   * Find nodes exceeding a line-count threshold.
+   *
+   * Mirrors the Python `GraphStore.get_nodes_by_size()` method.
+   */
+  getNodesBySize(
+    minLines: number = 50,
+    kind?: string,
+    filePathPattern?: string,
+    limit: number = 50,
+  ): Array<GraphNode & { lineCount: number }> {
+    const conditions = ['(line_end - line_start + 1) >= ?'];
+    const params: Array<string | number> = [minLines];
+
+    if (kind) {
+      conditions.push('kind = ?');
+      params.push(kind);
+    }
+    if (filePathPattern) {
+      conditions.push('file_path LIKE ?');
+      params.push(`%${filePathPattern}%`);
+    }
+
+    params.push(limit);
+    const where = conditions.join(' AND ');
+    const rows = this._db()
+      .prepare(
+        `SELECT * FROM nodes WHERE ${where} ` + // nosec
+        'ORDER BY (line_end - line_start + 1) DESC LIMIT ?',
+      )
+      .all(...params) as NodeRow[];
+
+    return rows.map((r) => ({
+      ...this._rowToNode(r),
+      lineCount:
+        r.line_start != null && r.line_end != null
+          ? r.line_end - r.line_start + 1
+          : 0,
+    }));
   }
 
   // -----------------------------------------------------------------------

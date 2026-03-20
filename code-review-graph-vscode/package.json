@@ -2,7 +2,7 @@
   "name": "code-review-graph",
   "displayName": "Code Review Graph",
   "description": "Visualize code dependencies, blast radius, and review context from your code-review-graph database directly in VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "tirth8205",
   "license": "MIT",
   "icon": "media/icons/icon.png",
@@ -78,6 +78,21 @@
         "icon": "$(beaker)"
       },
       {
+        "command": "codeReviewGraph.queryGraph",
+        "title": "Code Graph: Query Graph",
+        "icon": "$(symbol-keyword)"
+      },
+      {
+        "command": "codeReviewGraph.findCallees",
+        "title": "Code Graph: Find Callees",
+        "icon": "$(call-outgoing)"
+      },
+      {
+        "command": "codeReviewGraph.findLargeFunctions",
+        "title": "Code Graph: Find Large Functions",
+        "icon": "$(warning)"
+      },
+      {
         "command": "codeReviewGraph.showGraph",
         "title": "Code Graph: Show Graph",
         "icon": "$(type-hierarchy)"
@@ -93,6 +108,16 @@
         "icon": "$(git-compare)"
       },
       {
+        "command": "codeReviewGraph.embedGraph",
+        "title": "Code Graph: Compute Embeddings",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "codeReviewGraph.watchGraph",
+        "title": "Code Graph: Watch Mode",
+        "icon": "$(eye)"
+      },
+      {
         "command": "codeReviewGraph.buildGraph",
         "title": "Code Graph: Build Graph",
         "icon": "$(database)"
@@ -104,6 +129,13 @@
       }
     ],
     "menus": {
+      "scm/title": [
+        {
+          "command": "codeReviewGraph.reviewChanges",
+          "group": "navigation",
+          "when": "scmProvider == git"
+        }
+      ],
       "view/item/context": [
         {
           "command": "codeReviewGraph.showBlastRadius",
@@ -116,14 +148,19 @@
           "group": "codeGraph@2"
         },
         {
-          "command": "codeReviewGraph.findTests",
+          "command": "codeReviewGraph.findCallees",
           "when": "viewItem =~ /node-/",
           "group": "codeGraph@3"
         },
         {
-          "command": "codeReviewGraph.showGraph",
+          "command": "codeReviewGraph.findTests",
           "when": "viewItem =~ /node-/",
           "group": "codeGraph@4"
+        },
+        {
+          "command": "codeReviewGraph.showGraph",
+          "when": "viewItem =~ /node-/",
+          "group": "codeGraph@5"
         }
       ]
     },

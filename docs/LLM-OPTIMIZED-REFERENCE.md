@@ -33,7 +33,7 @@ MIT license. 100% local. No telemetry. DB file: .code-review-graph/graph.db
 
 <section name="watch">
 Run: code-review-graph watch (auto-updates graph on file save via watchdog)
-Or use PostEdit/PostGit hooks for automatic background updates.
+Or use PostToolUse (Write|Edit|Bash) hooks for automatic background updates.
 </section>
 
 <section name="embeddings">
@@ -44,7 +44,7 @@ Model: all-MiniLM-L6-v2 (384-dim, fast).
 </section>
 
 <section name="languages">
-Supported: Python, TypeScript, JavaScript, Go, Rust, Java, C#, Ruby, Kotlin, Swift, PHP, C/C++
+Supported: Python, TypeScript, JavaScript, Vue, Go, Rust, Java, C#, Ruby, Kotlin, Swift, PHP, C/C++
 Parser: Tree-sitter via tree-sitter-language-pack
 </section>
 

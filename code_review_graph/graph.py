@@ -189,11 +189,12 @@ class GraphStore:
         now = time.time()
         extra = json.dumps(edge.extra) if edge.extra else "{}"
 
-        # Check for existing edge
+        # Check for existing edge (include line so multiple call sites are preserved)
         existing = self._conn.execute(
             """SELECT id FROM edges
-               WHERE kind=? AND source_qualified=? AND target_qualified=? AND file_path=?""",
-            (edge.kind, edge.source, edge.target, edge.file_path),
+               WHERE kind=? AND source_qualified=? AND target_qualified=?
+                     AND file_path=? AND line=?""",
+            (edge.kind, edge.source, edge.target, edge.file_path, edge.line),
         ).fetchone()
 
         if existing:
@@ -265,6 +266,21 @@ class GraphStore:
     def get_edges_by_target(self, qualified_name: str) -> list[GraphEdge]:
         rows = self._conn.execute(
             "SELECT * FROM edges WHERE target_qualified = ?", (qualified_name,)
+        ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
+    def search_edges_by_target_name(self, name: str, kind: str = "CALLS") -> list[GraphEdge]:
+        """Search for edges where target_qualified matches an unqualified name.
+
+        CALLS edges often store unqualified target names (e.g. ``generateTestCode``)
+        rather than fully qualified ones (``file.ts::generateTestCode``).  This
+        method finds those edges by exact match on the plain function name so that
+        reverse call tracing (callers_of) works even when qualified-name lookup
+        returns nothing.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM edges WHERE target_qualified = ? AND kind = ?",
+            (name, kind),
         ).fetchall()
         return [self._row_to_edge(r) for r in rows]
 
@@ -429,6 +445,52 @@ class GraphStore:
             files_count=files_count,
             last_updated=last_updated,
         )
+
+    def get_nodes_by_size(
+        self,
+        min_lines: int = 50,
+        max_lines: int | None = None,
+        kind: str | None = None,
+        file_path_pattern: str | None = None,
+        limit: int = 50,
+    ) -> list[GraphNode]:
+        """Find nodes within a line-count range, ordered largest first.
+
+        Args:
+            min_lines: Minimum line count threshold (inclusive).
+            max_lines: Maximum line count threshold (inclusive). None = no upper bound.
+            kind: Filter by node kind (Function, Class, File, etc.).
+            file_path_pattern: SQL LIKE pattern to filter by file path.
+            limit: Maximum results to return.
+
+        Returns:
+            List of GraphNode objects, ordered by line count descending.
+        """
+        conditions = [
+            "line_start IS NOT NULL",
+            "line_end IS NOT NULL",
+            "(line_end - line_start + 1) >= ?",
+        ]
+        params: list = [min_lines]
+
+        if max_lines is not None:
+            conditions.append("(line_end - line_start + 1) <= ?")
+            params.append(max_lines)
+        if kind:
+            conditions.append("kind = ?")
+            params.append(kind)
+        if file_path_pattern:
+            conditions.append("file_path LIKE ?")
+            params.append(f"%{file_path_pattern}%")
+
+        params.append(limit)
+        where = " AND ".join(conditions)
+        rows = self._conn.execute(
+            f"SELECT * FROM nodes WHERE {where} "  # nosec B608
+            "ORDER BY (line_end - line_start + 1) DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [self._row_to_node(r) for r in rows]
 
     # --- Public edge access (for visualization etc.) ---
 

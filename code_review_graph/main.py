@@ -13,6 +13,7 @@ from fastmcp import FastMCP
 from .tools import (
     build_or_update_graph,
     embed_graph,
+    find_large_functions,
     get_docs_section,
     get_impact_radius,
     get_review_context,
@@ -20,6 +21,10 @@ from .tools import (
     query_graph,
     semantic_search_nodes,
 )
+
+# NOTE: Thread-safe for stdio MCP (single-threaded). If adding HTTP/SSE
+# transport with concurrent requests, replace with contextvars.ContextVar.
+_default_repo_root: str | None = None
 
 mcp = FastMCP(
     "code-review-graph",
@@ -204,11 +209,39 @@ def get_docs_section_tool(
     Args:
         section_name: The section to retrieve (e.g. "review-delta", "usage").
     """
-    return get_docs_section(section_name=section_name)
+    return get_docs_section(section_name=section_name, repo_root=_default_repo_root)
 
 
-def main() -> None:
+@mcp.tool()
+def find_large_functions_tool(
+    min_lines: int = 50,
+    kind: Optional[str] = None,
+    file_path_pattern: Optional[str] = None,
+    limit: int = 50,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Find functions, classes, or files exceeding a line-count threshold.
+
+    Useful for decomposition audits, code quality checks, and enforcing
+    size limits during code review. Results are ordered by line count.
+
+    Args:
+        min_lines: Minimum line count to flag. Default: 50.
+        kind: Optional filter: Function, Class, File, or Test.
+        file_path_pattern: Filter by file path substring (e.g. "components/").
+        limit: Maximum results. Default: 50.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return find_large_functions(
+        min_lines=min_lines, kind=kind, file_path_pattern=file_path_pattern,
+        limit=limit, repo_root=repo_root,
+    )
+
+
+def main(repo_root: str | None = None) -> None:
     """Run the MCP server via stdio."""
+    global _default_repo_root
+    _default_repo_root = repo_root
     mcp.run(transport="stdio")
 
 

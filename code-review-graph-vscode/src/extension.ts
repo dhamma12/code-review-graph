@@ -14,9 +14,11 @@ import { GraphWebviewPanel } from "./views/graphWebview";
 import { Installer } from "./onboarding/installer";
 import { registerWalkthroughCommands, showWelcomeIfNeeded } from "./onboarding/welcome";
 import { StatusBar } from "./views/statusBar";
+import { ScmDecorationProvider } from "./features/scmDecorations";
 
 let sqliteReader: SqliteReader | undefined;
 let autoUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+let scmDecorationProvider: ScmDecorationProvider | undefined;
 
 /**
  * Locate the graph database file in the workspace.
@@ -38,9 +40,21 @@ function findGraphDb(workspaceRoot: string): string | undefined {
 
 /**
  * Get the workspace root folder path, or undefined if no workspace is open.
+ * Checks all workspace folders for a graph database (multi-root support).
  */
 function getWorkspaceRoot(): string | undefined {
-  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders) { return undefined; }
+
+  // Prefer the folder that has a graph database
+  for (const folder of folders) {
+    if (findGraphDb(folder.uri.fsPath)) {
+      return folder.uri.fsPath;
+    }
+  }
+
+  // Fall back to first folder
+  return folders[0]?.uri.fsPath;
 }
 
 
@@ -296,6 +310,260 @@ function registerCommands(
     )
   );
 
+  // -----------------------------------------------------------------
+  // codeReviewGraph.queryGraph — expose all 8 query patterns
+  // -----------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codeReviewGraph.queryGraph", async () => {
+      if (!sqliteReader) {
+        vscode.window.showWarningMessage("Code Graph: No graph database loaded.");
+        return;
+      }
+
+      const patterns = [
+        { label: "callers_of", description: "Find functions calling the target" },
+        { label: "callees_of", description: "Find functions called by the target" },
+        { label: "imports_of", description: "Find modules imported by a file" },
+        { label: "importers_of", description: "Find files importing from the target" },
+        { label: "children_of", description: "Find nodes contained in a file or class" },
+        { label: "tests_for", description: "Find tests for a function or class" },
+        { label: "inheritors_of", description: "Find classes inheriting/implementing the target" },
+        { label: "file_summary", description: "List all nodes in a file" },
+      ];
+
+      const pattern = await vscode.window.showQuickPick(patterns, {
+        placeHolder: "Select a query pattern",
+      });
+      if (!pattern) { return; }
+
+      const target = await vscode.window.showInputBox({
+        prompt: `Enter the target for ${pattern.label}`,
+        placeHolder: "e.g., my_module.py::my_function or path/to/file.py",
+      });
+      if (!target) { return; }
+
+      // Map pattern to edge kind + direction
+      type QueryDef = { edgeKind: string; direction: "incoming" | "outgoing"; nodeFilter?: string };
+      const queryMap: Record<string, QueryDef> = {
+        callers_of: { edgeKind: "CALLS", direction: "incoming" },
+        callees_of: { edgeKind: "CALLS", direction: "outgoing" },
+        imports_of: { edgeKind: "IMPORTS_FROM", direction: "outgoing" },
+        importers_of: { edgeKind: "IMPORTS_FROM", direction: "incoming" },
+        children_of: { edgeKind: "CONTAINS", direction: "outgoing" },
+        tests_for: { edgeKind: "TESTED_BY", direction: "incoming" },
+        inheritors_of: { edgeKind: "INHERITS", direction: "incoming" },
+        file_summary: { edgeKind: "CONTAINS", direction: "outgoing" },
+      };
+
+      const qdef = queryMap[pattern.label];
+      if (!qdef) { return; }
+
+      // Try exact match, then search
+      let node = sqliteReader.getNode(target);
+      if (!node) {
+        const matches = sqliteReader.searchNodes(target, 5);
+        if (matches.length === 1) {
+          node = matches[0];
+        } else if (matches.length > 1) {
+          const selected = await vscode.window.showQuickPick(
+            matches.map(m => ({
+              label: m.name,
+              description: `${m.kind} · ${m.filePath}`,
+              node: m,
+            })),
+            { placeHolder: `Multiple matches for "${target}" — select one` },
+          );
+          if (!selected) { return; }
+          node = selected.node;
+        }
+      }
+
+      if (!node) {
+        vscode.window.showInformationMessage(`Code Graph: "${target}" not found.`);
+        return;
+      }
+
+      const edges = qdef.direction === "incoming"
+        ? sqliteReader.getEdgesByTarget(node.qualifiedName)
+        : sqliteReader.getEdgesBySource(node.qualifiedName);
+
+      const filtered = edges.filter(e => e.kind === qdef.edgeKind);
+
+      if (filtered.length === 0) {
+        vscode.window.showInformationMessage(
+          `Code Graph: No ${pattern.label} results for "${node.name}".`
+        );
+        return;
+      }
+
+      const items = filtered.map(e => {
+        const relatedQn = qdef.direction === "incoming" ? e.sourceQualified : e.targetQualified;
+        const relatedNode = sqliteReader!.getNode(relatedQn);
+        return {
+          label: relatedNode?.name ?? relatedQn,
+          description: relatedNode ? `${relatedNode.kind} · ${relatedNode.filePath}` : "",
+          detail: `Line ${relatedNode?.lineStart ?? e.line}`,
+          node: relatedNode,
+        };
+      });
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: `${pattern.label}: ${node.name} (${filtered.length} results)`,
+      });
+
+      if (selected?.node) {
+        await navigateToNode(selected.node);
+      }
+    })
+  );
+
+  // -----------------------------------------------------------------
+  // codeReviewGraph.findCallees
+  // -----------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codeReviewGraph.findCallees",
+      async (qualifiedName?: string) => {
+        if (!sqliteReader) {
+          vscode.window.showWarningMessage("Code Graph: No graph database loaded.");
+          return;
+        }
+
+        if (!qualifiedName) {
+          qualifiedName = await vscode.window.showInputBox({
+            prompt: "Enter the qualified name to find callees for",
+            placeHolder: "my_module.my_function",
+          });
+        }
+        if (!qualifiedName) { return; }
+
+        const edges = sqliteReader.getEdgesBySource(qualifiedName);
+        const calleeEdges = edges.filter(e => e.kind === "CALLS");
+
+        if (calleeEdges.length === 0) {
+          vscode.window.showInformationMessage(
+            `Code Graph: No callees found for "${qualifiedName}".`
+          );
+          return;
+        }
+
+        const items = calleeEdges.map(e => {
+          const calleeNode = sqliteReader!.getNode(e.targetQualified);
+          return {
+            label: calleeNode?.name ?? e.targetQualified,
+            description: calleeNode?.filePath ?? e.filePath,
+            detail: `Line ${calleeNode?.lineStart ?? e.line}`,
+            node: calleeNode,
+          };
+        });
+
+        const selected = await vscode.window.showQuickPick(items, {
+          placeHolder: `Callees of ${qualifiedName}`,
+        });
+
+        if (selected?.node) {
+          await navigateToNode(selected.node);
+        }
+      }
+    )
+  );
+
+  // -----------------------------------------------------------------
+  // codeReviewGraph.findLargeFunctions
+  // -----------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codeReviewGraph.findLargeFunctions",
+      async () => {
+        if (!sqliteReader) {
+          vscode.window.showWarningMessage("Code Graph: No graph database loaded.");
+          return;
+        }
+
+        const minLinesStr = await vscode.window.showInputBox({
+          prompt: "Minimum line count threshold",
+          placeHolder: "50",
+          value: "50",
+        });
+        if (!minLinesStr) { return; }
+
+        const minLines = parseInt(minLinesStr, 10);
+        if (isNaN(minLines) || minLines < 1) {
+          vscode.window.showWarningMessage("Code Graph: Invalid line count.");
+          return;
+        }
+
+        const results = sqliteReader.getNodesBySize(minLines, undefined, undefined, 50);
+
+        if (results.length === 0) {
+          vscode.window.showInformationMessage(
+            `Code Graph: No functions found with ${minLines}+ lines.`
+          );
+          return;
+        }
+
+        const items = results.map(r => ({
+          label: `${r.name} (${r.lineCount} lines)`,
+          description: `${r.kind} · ${r.filePath}`,
+          detail: `Lines ${r.lineStart ?? "?"}–${r.lineEnd ?? "?"}`,
+          node: r as GraphNode,
+        }));
+
+        const selected = await vscode.window.showQuickPick(items, {
+          placeHolder: `${results.length} nodes with ${minLines}+ lines`,
+        });
+
+        if (selected?.node) {
+          await navigateToNode(selected.node);
+        }
+      }
+    )
+  );
+
+  // -----------------------------------------------------------------
+  // codeReviewGraph.embedGraph
+  // -----------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codeReviewGraph.embedGraph", async () => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        vscode.window.showErrorMessage("No workspace folder is open.");
+        return;
+      }
+
+      const result = await cli.embedGraph(workspaceRoot);
+      if (result.success) {
+        vscode.window.showInformationMessage("Code Graph: Embeddings computed.");
+      } else {
+        const msg = result.stderr.includes("not installed")
+          ? "Install embeddings support: pip install code-review-graph[embeddings]"
+          : `Embedding failed: ${result.stderr}`;
+        vscode.window.showErrorMessage(`Code Graph: ${msg}`);
+      }
+    })
+  );
+
+  // -----------------------------------------------------------------
+  // codeReviewGraph.watchGraph
+  // -----------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codeReviewGraph.watchGraph", async () => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        vscode.window.showErrorMessage("No workspace folder is open.");
+        return;
+      }
+
+      vscode.window.showInformationMessage("Code Graph: Watch mode started.");
+      const result = await cli.watchGraph(workspaceRoot);
+      if (!result.success) {
+        vscode.window.showErrorMessage(
+          `Code Graph: Watch failed. ${result.stderr}`
+        );
+      }
+    })
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand("codeReviewGraph.showGraph", async () => {
       if (!sqliteReader) {
@@ -385,15 +653,18 @@ function registerCommands(
 
             let changedFiles: string[] = [];
             try {
-              const { stdout } = await execFileAsync(
-                "git",
-                ["diff", "--name-only", "HEAD"],
+              const r1 = await execFileAsync(
+                "git", ["diff", "--name-only", "HEAD"],
                 { cwd: workspaceRoot }
               );
-              changedFiles = stdout
-                .trim()
-                .split("\n")
-                .filter((line) => line.length > 0);
+              const r2 = await execFileAsync(
+                "git", ["diff", "--cached", "--name-only"],
+                { cwd: workspaceRoot }
+              );
+              changedFiles = [...new Set([
+                ...r1.stdout.trim().split("\n").filter(Boolean),
+                ...r2.stdout.trim().split("\n").filter(Boolean),
+              ])];
             } catch {
               // git not available or not a git repo
             }
@@ -405,12 +676,86 @@ function registerCommands(
               return;
             }
 
-            const impact = sqliteReader!.getImpactRadius(changedFiles);
+            const absFiles = changedFiles.map(f => path.join(workspaceRoot, f));
+            const impact = sqliteReader!.getImpactRadius(absFiles);
+
+            // --- Generate review guidance ---
+            const guidance: string[] = [];
+            const impactedFileCount = new Set(
+              impact.impactedNodes.map(n => n.filePath)
+            ).size;
+
+            // Test coverage check
+            const untestedFns: string[] = [];
+            for (const node of impact.changedNodes) {
+              if (node.kind !== "Function" || node.isTest) { continue; }
+              const edges = sqliteReader!.getEdgesByTarget(node.qualifiedName);
+              const hasCoverage = edges.some(e => e.kind === "TESTED_BY");
+              if (!hasCoverage) {
+                const out = sqliteReader!.getEdgesBySource(node.qualifiedName);
+                if (!out.some(e => e.kind === "TESTED_BY")) {
+                  untestedFns.push(node.name);
+                }
+              }
+            }
+
+            if (untestedFns.length > 0) {
+              guidance.push(
+                `\u26a0\ufe0f **${untestedFns.length} changed function(s) lack test coverage**: ${untestedFns.slice(0, 5).join(", ")}${untestedFns.length > 5 ? "..." : ""}`
+              );
+            }
+
+            // Wide blast radius warning
+            if (impactedFileCount > 10) {
+              guidance.push(
+                `\u26a0\ufe0f **Wide blast radius**: ${impactedFileCount} files impacted — consider splitting this change.`
+              );
+            }
+
+            // Inheritance changes
+            const inheritanceChanges = impact.edges.filter(
+              e => e.kind === "INHERITS" || e.kind === "IMPLEMENTS"
+            );
+            if (inheritanceChanges.length > 0) {
+              guidance.push(
+                `\u26a0\ufe0f **Inheritance chain affected**: ${inheritanceChanges.length} inheritance/implementation edge(s) touched.`
+              );
+            }
+
+            // Cross-file impacts
+            if (impact.impactedNodes.length > 0) {
+              guidance.push(
+                `\u2139\ufe0f ${impact.impactedNodes.length} nodes in ${impactedFileCount} file(s) may be affected by these changes.`
+              );
+            }
+
+            // Show guidance in output channel
+            const channel = vscode.window.createOutputChannel("Code Graph Review", { log: true });
+            channel.appendLine("# Review Guidance");
+            channel.appendLine("");
+            channel.appendLine(`Changed files: ${changedFiles.length}`);
+            channel.appendLine(`Changed nodes: ${impact.changedNodes.length}`);
+            channel.appendLine(`Impacted nodes: ${impact.impactedNodes.length}`);
+            channel.appendLine(`Impacted files: ${impactedFileCount}`);
+            channel.appendLine("");
+            if (guidance.length > 0) {
+              for (const g of guidance) { channel.appendLine(g); }
+            } else {
+              channel.appendLine("\u2705 No concerns detected.");
+            }
+            channel.show(true);
+
+            // Also show in graph
             GraphWebviewPanel.createOrShow(
               context.extensionUri,
               sqliteReader!,
               impact
             );
+
+            // Update SCM decorations
+            if (scmDecorationProvider && sqliteReader) {
+              await scmDecorationProvider.update(sqliteReader, workspaceRoot);
+            }
           }
         );
       }
@@ -547,6 +892,19 @@ export async function activate(
       // Graph database found - initialize
       sqliteReader = new SqliteReader(dbPath);
 
+      // Schema compatibility check
+      const schemaWarning = sqliteReader.checkSchemaCompatibility();
+      if (schemaWarning) {
+        const choice = await vscode.window.showWarningMessage(
+          `Code Graph: ${schemaWarning}`,
+          "Rebuild Graph",
+          "Dismiss"
+        );
+        if (choice === "Rebuild Graph") {
+          await vscode.commands.executeCommand("codeReviewGraph.buildGraph");
+        }
+      }
+
       // Register tree view providers
       const codeGraphProvider = new CodeGraphTreeProvider(
         sqliteReader,
@@ -575,11 +933,31 @@ export async function activate(
       statusBar.update(sqliteReader);
       statusBar.show();
       context.subscriptions.push(statusBar);
+
+      // Register SCM file decoration provider
+      scmDecorationProvider = new ScmDecorationProvider();
+      context.subscriptions.push(
+        vscode.window.registerFileDecorationProvider(scmDecorationProvider)
+      );
     } else {
       // No graph database found - show welcome
       showWelcomeIfNeeded(context);
     }
   }
+
+  // Register revealInTree command for bidirectional graph→tree sync
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codeReviewGraph.revealInTree",
+      (_qualifiedName: string) => {
+        // When a node is clicked in the graph, highlight it in the graph
+        // The graph webview already calls this; the tree view sync relies
+        // on the file navigation that nodeClicked also triggers.
+        // This command is a hook for future tree reveal integration.
+        GraphWebviewPanel.highlightNode(_qualifiedName);
+      }
+    )
+  );
 
   // Register commands (always, even without a database)
   registerCommands(context, cli);

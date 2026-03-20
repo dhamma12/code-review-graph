@@ -136,7 +136,8 @@ def generate_html(store: GraphStore, output_path: str | Path) -> Path:
     """
     output_path = Path(output_path)
     data = export_graph_data(store)
-    data_json = json.dumps(data, default=str)
+    # Escape </script> inside JSON to prevent premature tag closure (XSS defense)
+    data_json = json.dumps(data, default=str).replace("</", "<\\/")
     html = _HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
     output_path.write_text(html, encoding="utf-8")
     return output_path
@@ -322,9 +323,15 @@ edges.forEach(e => {
 
 function allDescendants(qn) {
   const result = new Set();
-  const children = containsChildren.get(qn);
-  if (!children) return result;
-  for (const c of children) { result.add(c); for (const d of allDescendants(c)) result.add(d); }
+  const stack = [qn];
+  while (stack.length) {
+    const cur = stack.pop();
+    const children = containsChildren.get(cur);
+    if (!children) continue;
+    for (const c of children) {
+      if (!result.has(c)) { result.add(c); stack.push(c); }
+    }
+  }
   return result;
 }
 
