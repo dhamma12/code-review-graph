@@ -11,6 +11,7 @@ from typing import Optional
 from fastmcp import FastMCP
 
 from .tools import (
+    apply_refactor_func,
     build_or_update_graph,
     detect_changes_func,
     embed_graph,
@@ -26,6 +27,7 @@ from .tools import (
     list_flows,
     list_graph_stats,
     query_graph,
+    refactor_func,
     semantic_search_nodes,
 )
 
@@ -407,6 +409,65 @@ def detect_changes_tool(
         base=base, changed_files=changed_files,
         include_source=include_source, max_depth=max_depth,
         repo_root=repo_root,
+    )
+
+
+@mcp.tool()
+def refactor_tool(
+    mode: str = "rename",
+    old_name: Optional[str] = None,
+    new_name: Optional[str] = None,
+    kind: Optional[str] = None,
+    file_pattern: Optional[str] = None,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Graph-powered refactoring operations.
+
+    Unified entry point for rename previews, dead code detection, and
+    refactoring suggestions.
+
+    Modes:
+    - rename: Preview renaming a symbol. Returns an edit list and a refactor_id
+      to pass to apply_refactor_tool. Requires old_name and new_name.
+    - dead_code: Find unreferenced functions/classes (no callers, tests, or
+      importers, and not entry points).
+    - suggest: Get community-driven refactoring suggestions (move misplaced
+      functions, remove dead code).
+
+    Args:
+        mode: Operation mode: "rename", "dead_code", or "suggest".
+        old_name: (rename) Current symbol name to rename.
+        new_name: (rename) Desired new name for the symbol.
+        kind: (dead_code) Optional filter: Function or Class.
+        file_pattern: (dead_code) Filter by file path substring.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return refactor_func(
+        mode=mode, old_name=old_name, new_name=new_name,
+        kind=kind, file_pattern=file_pattern, repo_root=repo_root,
+    )
+
+
+@mcp.tool()
+def apply_refactor_tool(
+    refactor_id: str,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Apply a previously previewed refactoring to source files.
+
+    Takes a refactor_id from a prior refactor_tool(mode="rename") call and
+    applies the exact string replacements to the target files. Previews
+    expire after 10 minutes.
+
+    Security: All edit paths are validated to be within the repo root.
+    Only exact string replacements are performed (no regex, no eval).
+
+    Args:
+        refactor_id: The refactor ID from refactor_tool's response.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return apply_refactor_func(
+        refactor_id=refactor_id, repo_root=repo_root,
     )
 
 
