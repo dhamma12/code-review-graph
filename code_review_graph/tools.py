@@ -955,7 +955,8 @@ def list_flows(
     """
     store, root = _get_store(repo_root)
     try:
-        flows = get_flows(store, sort_by=sort_by, limit=limit)
+        fetch_limit = limit if not kind else limit * 10  # fetch more when filtering
+        flows = get_flows(store, sort_by=sort_by, limit=fetch_limit)
 
         if kind:
             filtered = []
@@ -967,7 +968,7 @@ def list_flows(
                     ).fetchone()
                     if row and row["kind"] == kind:
                         filtered.append(f)
-            flows = filtered
+            flows = filtered[:limit]
 
         return {
             "status": "ok",
@@ -1029,7 +1030,10 @@ def get_flow(
         # Optionally include source snippets for each step
         if include_source and "steps" in flow:
             for step in flow["steps"]:
-                file_path = root / step["file"] if step.get("file") else None
+                fp = Path(step["file"]) if step.get("file") else None
+                if fp is not None and not fp.is_absolute():
+                    fp = root / fp
+                file_path = fp
                 if file_path and file_path.is_file():
                     try:
                         lines = file_path.read_text(errors="replace").splitlines()
