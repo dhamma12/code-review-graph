@@ -102,6 +102,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
     ".lua": "lua",
     ".ipynb": "notebook",
+    ".yaml": "powerfx",  # Power Apps .fx.yaml Canvas App source files
 }
 
 # Tree-sitter node type mappings per language
@@ -322,6 +323,10 @@ class CodeParser:
         # Jupyter notebooks: extract code cells and parse as Python
         if language == "notebook":
             return self._parse_notebook(path, source)
+
+        # Power Apps Canvas App .fx.yaml source files (Power Fx formula language)
+        if language == "powerfx":
+            return self._parse_powerfx(path, source)
 
         # Databricks .py notebook exports
         if language == "python" and source.startswith(
@@ -709,6 +714,126 @@ class CodeParser:
                     ))
 
         return all_nodes, all_edges
+
+    # ---------------------------------------------------------------------------
+    # Power Apps Canvas App (.fx.yaml) parser
+    # ---------------------------------------------------------------------------
+
+    # Known SharePoint data sources referenced in Power Fx formulas
+    _POWERFX_DATASOURCES: frozenset[str] = frozenset({
+        "CRRequests", "CRStakeholderReviews", "CRUserAdmin", "AIPSGMeetings",
+    })
+
+    # Regex: quoted or unquoted top-level screen declaration
+    _SCREEN_DECL_RE = re.compile(
+        r"^(?:'([^']+)'|(\S+))\s+As\s+screen\s*:",
+        re.MULTILINE,
+    )
+    # Regex: Navigate() calls — extract the target screen name
+    _NAVIGATE_RE = re.compile(
+        r"Navigate\(\s*'([^']+)'",
+        re.MULTILINE,
+    )
+    # Regex: control declarations (2–3 letter prefix + PascalCase name + As <type>:)
+    _CONTROL_RE = re.compile(
+        r"^\s{4}([a-z]{2,3}[A-Z]\w+)\s+As\s+\w+\s*:",
+        re.MULTILINE,
+    )
+
+    def _parse_powerfx(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse a Power Apps Canvas App .fx.yaml source file.
+
+        Extracts:
+        - A File node for the screen file
+        - A Screen (Class) node for the screen itself
+        - Control (Function) nodes for named controls (btn*, gal*, lbl*, etc.)
+        - CALLS edges for Navigate() calls to other screens
+        - IMPORTS_FROM edges for SharePoint data source references
+        """
+        text = source.decode("utf-8", errors="replace")
+        file_path_str = str(path)
+        line_count = text.count("\n") + 1
+        nodes: list[NodeInfo] = []
+        edges: list[EdgeInfo] = []
+
+        # File node
+        nodes.append(NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=line_count,
+            language="powerfx",
+        ))
+
+        # Screen node — derive from the YAML screen declaration or from filename
+        screen_match = self._SCREEN_DECL_RE.search(text)
+        if screen_match:
+            screen_name = screen_match.group(1) or screen_match.group(2)
+            screen_line = text[: screen_match.start()].count("\n") + 1
+        else:
+            # App.fx.yaml has no screen declaration — use stem as name
+            screen_name = path.stem
+            screen_line = 1
+
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=screen_name,
+            file_path=file_path_str,
+            line_start=screen_line,
+            line_end=line_count,
+            language="powerfx",
+        ))
+
+        # Control nodes (top-level indented controls, e.g. btnViewCRsHS)
+        for ctrl_match in self._CONTROL_RE.finditer(text):
+            ctrl_name = ctrl_match.group(1)
+            ctrl_line = text[: ctrl_match.start()].count("\n") + 1
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=ctrl_name,
+                file_path=file_path_str,
+                line_start=ctrl_line,
+                line_end=ctrl_line,
+                language="powerfx",
+                parent_name=screen_name,
+            ))
+
+        # CALLS edges: Navigate('Target Screen', ...) → target screen file
+        seen_navigate: set[str] = set()
+        for nav_match in self._NAVIGATE_RE.finditer(text):
+            target_screen = nav_match.group(1)
+            if target_screen == screen_name or target_screen in seen_navigate:
+                continue
+            seen_navigate.add(target_screen)
+            nav_line = text[: nav_match.start()].count("\n") + 1
+            # Resolve target to its expected file path (sibling .fx.yaml)
+            target_file = str(path.parent / f"{target_screen}.fx.yaml")
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=screen_name,
+                target=target_screen,
+                file_path=file_path_str,
+                line=nav_line,
+                extra={"target_file": target_file},
+            ))
+
+        # IMPORTS_FROM edges: data source references in Power Fx formulas
+        seen_ds: set[str] = set()
+        for ds_name in self._POWERFX_DATASOURCES:
+            if ds_name not in seen_ds and ds_name in text:
+                seen_ds.add(ds_name)
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=screen_name,
+                    target=ds_name,
+                    file_path=file_path_str,
+                    line=0,
+                ))
+
+        return nodes, edges
 
     def _parse_databricks_py_notebook(
         self, path: Path, source: bytes,
